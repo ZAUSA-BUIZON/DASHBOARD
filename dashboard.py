@@ -6,11 +6,92 @@ import calendar
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import re
 
 today = datetime.today()
 yesterday = today - timedelta(days=1)
 day_before_yesterday = today - timedelta(days=2)
 
+def get_ppr_data(xls, active_sheet, df, start_date, end_date):
+    ppr_data = []
+    ppr_sheets = [sheet for sheet in xls.sheet_names if 'PPR' in sheet and 'Target' not in sheet]
+
+    if not ppr_sheets:
+        st.warning("No PPR sheets found.")
+        return pd.DataFrame(columns=["Site Name", "PPR"]) 
+
+    for sheet in ppr_sheets:
+        try:
+            # Extract year from sheet name
+            match = re.search(r'\d{4}', sheet)
+            if not match:
+                continue
+            sheet_year = int(match.group())
+
+            df_ppr = pd.read_excel(xls, sheet_name=sheet, header=0)
+            df_ppr.columns = df_ppr.columns.str.strip().astype(str)
+
+            # SMIP block filtering
+            smip_rows = df_ppr.apply(lambda row: any('SMIP per SITE' in str(cell) and 'OUTSIDE' not in str(cell) for cell in row), axis=1)
+            outside_smip_rows = df_ppr.apply(lambda row: any('OUTSIDE SMIP per SITE' in str(cell) for cell in row), axis=1)
+
+            if any(smip_rows) and any(outside_smip_rows):
+                smip_indices = df_ppr[smip_rows].index
+                outside_smip_indices = df_ppr[outside_smip_rows].index
+
+                if active_sheet == "SMIP Database":
+                    start_idx = min(smip_indices)
+                    end_idx = min(outside_smip_indices) if any(outside_smip_indices) else len(df_ppr)
+                elif active_sheet == "Outside-SMIP Database":
+                    start_idx = min(outside_smip_indices)
+                    next_smip_indices = [idx for idx in smip_indices if idx > start_idx]
+                    end_idx = min(next_smip_indices) if next_smip_indices else len(df_ppr)
+                else:
+                    continue
+
+                df_ppr = df_ppr.iloc[start_idx:end_idx].reset_index(drop=True)
+
+            if "Site Name" not in df_ppr.columns:
+                continue
+
+            df_ppr = df_ppr[df_ppr["Site Name"].astype(str).isin(df["Site Name"].astype(str))]
+
+            date_cols = []
+            col_date_map = {}
+
+            for col in df_ppr.columns:
+                if col == "Site Name":
+                    continue
+                try:
+                    full_date_str = f"{col}-{sheet_year}"
+                    parsed_date = pd.to_datetime(full_date_str, format='%b-%d-%Y', errors='coerce')
+                    if pd.notna(parsed_date) and start_date <= parsed_date <= end_date:
+                        date_cols.append(col)
+                        col_date_map[col] = parsed_date
+                except:
+                    continue
+
+            if not date_cols:
+                continue
+
+            df_melted = df_ppr[["Site Name"] + date_cols].copy()
+            df_melted = df_melted.melt(id_vars="Site Name", value_vars=date_cols, var_name="DateStr", value_name="PPR")
+            df_melted["Date"] = df_melted["DateStr"].map(col_date_map)
+            df_melted["PPR"] = pd.to_numeric(df_melted["PPR"], errors='coerce') * 100
+
+            df_cleaned = df_melted.dropna(subset=["PPR"])
+            result_df = df_cleaned.groupby("Site Name", as_index=False)["PPR"].mean()
+
+            ppr_data.append(result_df)
+
+        except Exception as e:
+            st.warning(f"Error processing PPR sheet '{sheet}': {str(e)}")
+
+    if ppr_data:
+        combined_ppr_df = pd.concat(ppr_data, ignore_index=True)
+        return combined_ppr_df
+    else:
+        return pd.DataFrame(columns=["Site Name", "PPR"])
 
 def get_filtered_table(xls, active_sheet, df, start_date, end_date, selected_cluster):
     result_df = df.copy()
@@ -550,7 +631,6 @@ def get_target_kwh(xls, active_sheet, df, start_date, end_date):
         st.warning(f"No Target kWh sheets found for years {selected_years}.")
         return pd.DataFrame(columns=["Date", "Target kWh", "Cluster"])
     
-    
     for sheet in target_sheets:
         try:
             df_target = pd.read_excel(xls, sheet_name=sheet, header=0)
@@ -608,7 +688,65 @@ def get_target_kwh(xls, active_sheet, df, start_date, end_date):
     else:
         st.warning("No matching Target kWh data found in any sheet.")
         return pd.DataFrame(columns=["Date", "Target kWh", "Cluster"])
-        
+
+def get_yesterday_ranking_per_cluster(df, yesterday_kwh_df, yesterday_sp_df, yesterday_ppr_df):
+    site_cluster_map = df[["Site Name", "Cluster"]].drop_duplicates().set_index("Site Name")["Cluster"].to_dict()
+    
+    if "Site Name" in yesterday_kwh_df.columns:
+        yesterday_kwh_df["Cluster"] = yesterday_kwh_df["Site Name"].map(site_cluster_map)
+    
+    if "Site Name" in yesterday_sp_df.columns:
+        yesterday_sp_df["Cluster"] = yesterday_sp_df["Site Name"].map(site_cluster_map)
+    
+    if "Site Name" in yesterday_ppr_df.columns:
+        yesterday_ppr_df["Cluster"] = yesterday_ppr_df["Site Name"].map(site_cluster_map)
+    
+    cluster_kwh_df = yesterday_kwh_df.groupby("Cluster", as_index=False)["kWh"].sum()
+    cluster_sp_df = yesterday_sp_df.groupby("Cluster", as_index=False)["Specific Production"].mean()
+    cluster_ppr_df = yesterday_ppr_df.groupby("Cluster", as_index=False)["PPR"].mean()
+    
+    cluster_results_df = pd.merge(cluster_kwh_df, cluster_sp_df, on="Cluster", how="outer")
+    cluster_results_df = pd.merge(cluster_results_df, cluster_ppr_df, on="Cluster", how="outer")
+    
+    cluster_results_df = cluster_results_df.sort_values(by=["PPR", "Specific Production", "kWh"], ascending=False)
+    cluster_results_df.reset_index(drop=True, inplace=True)
+    
+    if "kWh" in cluster_results_df.columns:
+        cluster_results_df["kWh"] = cluster_results_df["kWh"].round(2)
+    
+    if "Specific Production" in cluster_results_df.columns:
+        cluster_results_df["Specific Production"] = cluster_results_df["Specific Production"].round(1)
+    
+    if "PPR" in cluster_results_df.columns:
+        cluster_results_df["PPR"] = cluster_results_df["PPR"].round(2)
+    
+    return cluster_results_df
+def get_last_7_days_ranking_per_cluster(df, last_7_days_df):
+    site_cluster_map = df[["Site Name", "Cluster"]].drop_duplicates().set_index("Site Name")["Cluster"].to_dict()
+    
+    if "Site Name" in last_7_days_df.columns:
+        last_7_days_df["Cluster"] = last_7_days_df["Site Name"].map(site_cluster_map)
+    
+    cluster_kwh_df = last_7_days_df.groupby("Cluster", as_index=False)["kWh"].sum()
+    cluster_sp_df = last_7_days_df.groupby("Cluster", as_index=False)["Specific Production"].mean()
+    cluster_ppr_df = last_7_days_df.groupby("Cluster", as_index=False)["PPR"].mean()
+    
+    cluster_results_df = pd.merge(cluster_kwh_df, cluster_sp_df, on="Cluster", how="outer")
+    cluster_results_df = pd.merge(cluster_results_df, cluster_ppr_df, on="Cluster", how="outer")
+    
+    cluster_results_df = cluster_results_df.sort_values(by=["PPR", "Specific Production", "kWh"], ascending=False)
+    cluster_results_df.reset_index(drop=True, inplace=True)
+    
+    if "kWh" in cluster_results_df.columns:
+        cluster_results_df["kWh"] = cluster_results_df["kWh"].round(2)
+    
+    if "Specific Production" in cluster_results_df.columns:
+        cluster_results_df["Specific Production"] = cluster_results_df["Specific Production"].round(1)
+    
+    if "PPR" in cluster_results_df.columns:
+        cluster_results_df["PPR"] = cluster_results_df["PPR"].round(2)
+    
+    return cluster_results_df
 def get_yesterday_kwh(xls, active_sheet, df):
     yesterday_abbr = yesterday.strftime('%b-%d')
 
@@ -796,7 +934,6 @@ def get_last_7_days_table(xls, active_sheet, df):
     last_7_days_kwh_df = last_7_days_kwh_df.groupby("Site Name", as_index=False).agg({"kWh": "sum"})
     last_7_days_kwh_df["kWh"] = (pd.to_numeric(last_7_days_kwh_df["kWh"], errors="coerce").round(2).fillna(0))
 
-
     sp_sheets = [sheet for sheet in xls.sheet_names if 'SP' in sheet and 'Target' not in sheet]
     if not sp_sheets:
         st.warning("No Specific Production sheets found.")
@@ -886,291 +1023,12 @@ def get_last_7_days_table(xls, active_sheet, df):
     last_7_days_ppr_df = last_7_days_ppr_df.groupby("Site Name", as_index=False).agg({"PPR": "mean"})
     last_7_days_ppr_df["PPR"] = (pd.to_numeric(last_7_days_ppr_df["PPR"], errors="coerce").round(2).fillna(0))
 
-
     last_7_days_df = pd.merge(last_7_days_kwh_df, last_7_days_sp_df, on="Site Name", how="outer")
     last_7_days_df = pd.merge(last_7_days_df, last_7_days_ppr_df, on="Site Name", how="outer")
 
     last_7_days_df = last_7_days_df.sort_values(by="PPR", ascending=False)
 
     return last_7_days_df
-
-def get_last_30_days_table(xls, active_sheet, df):
-    last_30_days_kwh_df = pd.DataFrame(columns=["Site Name", "kWh"])
-    last_30_days_sp_df = pd.DataFrame(columns=["Site Name", "Specific Production"])
-    last_30_days_ppr_df = pd.DataFrame(columns=["Site Name", "PPR"])
-
-    kwh_sheets = [sheet for sheet in xls.sheet_names if 'kWh' in sheet and 'Target' not in sheet]
-    if not kwh_sheets:
-        st.warning("No kWh sheets found.")
-        return pd.DataFrame(columns=["Site Name", "kWh"]) 
-
-    latest_kwh_sheet = max(kwh_sheets, key=lambda x: int(''.join(filter(str.isdigit, x))))
-    df_kwh = pd.read_excel(xls, sheet_name=latest_kwh_sheet, header=0) 
-    df_kwh.columns = df_kwh.columns.str.strip()
-
-    smip_rows = df_kwh.apply(lambda row: any('SMIP' in str(cell) and 'OUTSIDE' not in str(cell) 
-                                         for cell in row), axis=1)
-    outside_smip_rows = df_kwh.apply(lambda row: any('OUTSIDE SMIP' in str(cell) 
-                                                for cell in row), axis=1)
-    
-    if any(smip_rows) and any(outside_smip_rows):
-        smip_indices = df_kwh[smip_rows].index
-        outside_smip_indices = df_kwh[outside_smip_rows].index
-        
-        if active_sheet == "SMIP Database":
-            start_idx = min(smip_indices)
-            end_idx = min(outside_smip_indices)
-            df_kwh = df_kwh.iloc[start_idx:end_idx].reset_index(drop=True)
-        elif active_sheet == "Outside-SMIP Database":
-            start_idx = min(outside_smip_indices)
-            next_smip_indices = [idx for idx in smip_indices if idx > start_idx]
-            end_idx = min(next_smip_indices) if next_smip_indices else len(df_kwh)
-            df_kwh = df_kwh.iloc[start_idx:end_idx].reset_index(drop=True)
-
-    if "Site Name" in df_kwh.columns and "Cluster" in df.columns:
-        df_kwh = df_kwh[df_kwh["Site Name"].isin(df["Site Name"].unique())]
-        df_kwh = df_kwh[df_kwh["Cluster"].isin(df["Cluster"].unique())]
-
-    for i in range(30):
-        date_abbr = (yesterday - timedelta(days=i)).strftime('%b-%d')
-        matching_columns = [col for col in df_kwh.columns.astype(str) if date_abbr in col]
-
-        if matching_columns:
-            df_kwh["kWh"] = pd.to_numeric(df_kwh[matching_columns].sum(axis=1), errors='coerce')
-            daily_result_kwh_df = df_kwh.groupby("Site Name", as_index=False)["kWh"].sum()
-            last_30_days_kwh_df = pd.concat([last_30_days_kwh_df, daily_result_kwh_df], ignore_index=True)
-
-    last_30_days_kwh_df = last_30_days_kwh_df.groupby("Site Name", as_index=False).agg({"kWh": "sum"})
-    last_30_days_kwh_df["kWh"] = (pd.to_numeric(last_30_days_kwh_df["kWh"], errors="coerce").round(2).fillna(0))
-
-
-    sp_sheets = [sheet for sheet in xls.sheet_names if 'SP' in sheet and 'Target' not in sheet]
-    if not sp_sheets:
-        st.warning("No Specific Production sheets found.")
-        return pd.DataFrame(columns=["Site Name", "Specific Production"]) 
-
-    latest_sp_sheet = max(sp_sheets, key=lambda x: int(''.join(filter(str.isdigit, x))))
-    df_sp = pd.read_excel(xls, sheet_name=latest_sp_sheet, header=0) 
-    df_sp.columns = df_sp.columns.str.strip()
-
-    smip_rows = df_sp.apply(lambda row: any('SMIP' in str(cell) and 'OUTSIDE' not in str(cell) 
-                                         for cell in row), axis=1)
-    outside_smip_rows = df_sp.apply(lambda row: any('OUTSIDE SMIP' in str(cell) 
-                                                for cell in row), axis=1)
-    
-    if any(smip_rows) and any(outside_smip_rows):
-        smip_indices = df_sp[smip_rows].index
-        outside_smip_indices = df_sp[outside_smip_rows].index
-        
-        if active_sheet == "SMIP Database":
-            start_idx = min(smip_indices)
-            end_idx = min(outside_smip_indices)
-            df_sp = df_sp.iloc[start_idx:end_idx].reset_index(drop=True)
-        elif active_sheet == "Outside-SMIP Database":
-            start_idx = min(outside_smip_indices)
-            next_smip_indices = [idx for idx in smip_indices if idx > start_idx]
-            end_idx = min(next_smip_indices) if next_smip_indices else len(df_sp)
-            df_sp = df_sp.iloc[start_idx:end_idx].reset_index(drop=True)
-
-    if "Site Name" in df_sp.columns:
-        df_sp = df_sp[df_sp["Site Name"].isin(df["Site Name"].unique())]
-
-    for i in range(30):
-        date_abbr = (yesterday - timedelta(days=i)).strftime('%b-%d')
-        matching_columns = [col for col in df_sp.columns.astype(str) if date_abbr in col]
-
-        if matching_columns:
-            df_sp["Specific Production"] = pd.to_numeric(df_sp[matching_columns].mean(axis=1), errors='coerce')
-            daily_result_sp_df = df_sp.groupby("Site Name", as_index=False)["Specific Production"].mean()
-            last_30_days_sp_df = pd.concat([last_30_days_sp_df, daily_result_sp_df], ignore_index=True)
-
-    last_30_days_sp_df = last_30_days_sp_df.groupby("Site Name", as_index=False).agg({"Specific Production": "mean"})
-    last_30_days_sp_df["Specific Production"] = last_30_days_sp_df["Specific Production"].round(2)
-
-    ppr_sheets = [sheet for sheet in xls.sheet_names if 'PPR' in sheet and 'Target' not in sheet]
-    if not ppr_sheets:
-        st.warning("No PPR sheets found.")
-        return pd.DataFrame(columns=["Site Name", "PPR"]) 
-
-    latest_ppr_sheet = max(ppr_sheets, key=lambda x: int(''.join(filter(str.isdigit, x))))
-    df_ppr = pd.read_excel(xls, sheet_name=latest_ppr_sheet, header=0) 
-    df_ppr.columns = df_ppr.columns.str.strip()
-
-    smip_rows = df_ppr.apply(lambda row: any('SMIP per SITE' in str(cell) and 'OUTSIDE' not in str(cell) 
-                                         for cell in row), axis=1)
-    outside_smip_rows = df_ppr.apply(lambda row: any('OUTSIDE SMIP per SITE' in str(cell) 
-                                                for cell in row), axis=1)
-    
-    if any(smip_rows) and any(outside_smip_rows):
-        smip_indices = df_ppr[smip_rows].index
-        outside_smip_indices = df_ppr[outside_smip_rows].index
-        
-        if active_sheet == "SMIP Database":
-            start_idx = min(smip_indices)
-            end_idx = min(outside_smip_indices)
-            df_ppr = df_ppr.iloc[start_idx:end_idx].reset_index(drop=True)
-        elif active_sheet == "Outside-SMIP Database":
-            start_idx = min(outside_smip_indices)
-            next_smip_indices = [idx for idx in smip_indices if idx > start_idx]
-            end_idx = min(next_smip_indices) if next_smip_indices else len(df_ppr)
-            df_ppr = df_ppr.iloc[start_idx:end_idx].reset_index(drop=True)
-
-    if "Site Name" in df_ppr.columns:
-        df_ppr = df_ppr[df_ppr["Site Name"].isin(df["Site Name"].unique())]
-
-    for i in range(30):
-        date_abbr = (yesterday - timedelta(days=i)).strftime('%b-%d')
-        matching_columns = [col for col in df_ppr.columns.astype(str) if date_abbr in col]
-
-        if matching_columns:
-            df_ppr["PPR"] = df_ppr[matching_columns].mean(axis=1) * 100
-            daily_result_ppr_df = df_ppr.groupby("Site Name", as_index=False)["PPR"].mean()
-            last_30_days_ppr_df = pd.concat([last_30_days_ppr_df, daily_result_ppr_df], ignore_index=True)
-
-    last_30_days_ppr_df = last_30_days_ppr_df.groupby("Site Name", as_index=False).agg({"PPR": "mean"})
-    last_30_days_ppr_df["PPR"] = (pd.to_numeric(last_30_days_ppr_df["PPR"], errors="coerce").round(2).fillna(0))
-
-
-    last_30_days_df = pd.merge(last_30_days_kwh_df, last_30_days_sp_df, on="Site Name", how="outer")
-    last_30_days_df = pd.merge(last_30_days_df, last_30_days_ppr_df, on="Site Name", how="outer")
-
-    last_30_days_df = last_30_days_df.sort_values(by="PPR", ascending=False)
-
-    return last_30_days_df
-
-def get_this_year_table(xls, active_sheet, df):
-    today = datetime.today()
-    current_year = today.year
-    this_year_kwh_df = pd.DataFrame(columns=["Site Name", "kWh"])
-    this_year_sp_df = pd.DataFrame(columns=["Site Name", "Specific Production"])
-    this_year_ppr_df = pd.DataFrame(columns=["Site Name", "PPR"])
-
-    kwh_sheet_name = f"{current_year} kWh"
-    if kwh_sheet_name not in xls.sheet_names:
-        st.warning(f"No sheet found for {kwh_sheet_name}.")
-        return pd.DataFrame(columns=["Site Name", "kWh"])
-
-    df_kwh = pd.read_excel(xls, sheet_name=kwh_sheet_name, header=0)
-    df_kwh.columns = df_kwh.columns.str.strip()
-
-    smip_rows = df_kwh.apply(lambda row: any('SMIP' in str(cell) and 'OUTSIDE' not in str(cell) 
-                                         for cell in row), axis=1)
-    outside_smip_rows = df_kwh.apply(lambda row: any('OUTSIDE SMIP' in str(cell) 
-                                                for cell in row), axis=1)
-    
-    if any(smip_rows) and any(outside_smip_rows):
-        smip_indices = df_kwh[smip_rows].index
-        outside_smip_indices = df_kwh[outside_smip_rows].index
-        
-        if active_sheet == "SMIP Database":
-            start_idx = min(smip_indices)
-            end_idx = min(outside_smip_indices)
-            df_kwh = df_kwh.iloc[start_idx:end_idx].reset_index(drop=True)
-        elif active_sheet == "Outside-SMIP Database":
-            start_idx = min(outside_smip_indices)
-            next_smip_indices = [idx for idx in smip_indices if idx > start_idx]
-            end_idx = min(next_smip_indices) if next_smip_indices else len(df_kwh)
-            df_kwh = df_kwh.iloc[start_idx:end_idx].reset_index(drop=True)
-
-    if "Site Name" in df_kwh.columns:
-        df_kwh = df_kwh[df_kwh["Site Name"].isin(df["Site Name"].unique())]
-
-    daily_columns = [col for col in df_kwh.columns if '-' in str(col)]
-
-    if daily_columns:
-        df_kwh[daily_columns] = df_kwh[daily_columns].apply(pd.to_numeric, errors='coerce')
-        df_kwh["kWh"] = df_kwh[daily_columns].sum(axis=1)
-        this_year_kwh_df = df_kwh.groupby("Site Name", as_index=False)["kWh"].sum()
-    else:
-        st.warning("No daily columns found in the filtered data.")
-
-    this_year_kwh_df["kWh"] = this_year_kwh_df["kWh"].round(2)
-
-    sp_sheet_name = f"{current_year} SP"
-    if sp_sheet_name not in xls.sheet_names:
-        st.warning(f"No sheet found for {sp_sheet_name}.")
-        return pd.DataFrame(columns=["Site Name", "Specific Production"])
-
-    df_sp = pd.read_excel(xls, sheet_name=sp_sheet_name, header=0)
-    df_sp.columns = df_sp.columns.str.strip()
-
-    smip_rows = df_sp.apply(lambda row: any('SMIP' in str(cell) and 'OUTSIDE' not in str(cell) 
-                                         for cell in row), axis=1)
-    outside_smip_rows = df_sp.apply(lambda row: any('OUTSIDE SMIP' in str(cell) 
-                                                for cell in row), axis=1)
-    
-    if any(smip_rows) and any(outside_smip_rows):
-        smip_indices = df_sp[smip_rows].index
-        outside_smip_indices = df_sp[outside_smip_rows].index
-        
-        if active_sheet == "SMIP Database":
-            start_idx = min(smip_indices)
-            end_idx = min(outside_smip_indices)
-            df_sp = df_sp.iloc[start_idx:end_idx].reset_index(drop=True)
-        elif active_sheet == "Outside-SMIP Database":
-            start_idx = min (outside_smip_indices)
-            next_smip_indices = [idx for idx in smip_indices if idx > start_idx]
-            end_idx = min(next_smip_indices) if next_smip_indices else len(df_sp)
-            df_sp = df_sp.iloc[start_idx:end_idx].reset_index(drop=True)
-
-    if "Site Name" in df_sp.columns:
-        df_sp = df_sp[df_sp["Site Name"].isin(df["Site Name"].unique())]
-
-    sp_columns = [col for col in df_sp.columns if '-' in str(col)]
-    if sp_columns:
-        df_sp[sp_columns] = df_sp[sp_columns].apply(pd.to_numeric, errors='coerce')
-        df_sp["Specific Production"] = df_sp[sp_columns].mean(axis=1)
-        this_year_sp_df = df_sp.groupby("Site Name", as_index=False)["Specific Production"].mean()
-    else:
-        st.warning("No valid 'SP' columns found in the filtered data.")
-
-    this_year_sp_df["Specific Production"] = this_year_sp_df["Specific Production"].round(2)
-
-    ppr_sheet_name = f"{current_year} PPR"
-    if ppr_sheet_name not in xls.sheet_names:
-        st.warning(f"No sheet found for {ppr_sheet_name}.")
-        return pd.DataFrame(columns=["Site Name", "PPR"])
-
-    df_ppr = pd.read_excel(xls, sheet_name=ppr_sheet_name, header=0)
-    df_ppr.columns = df_ppr.columns.str.strip()
-
-    smip_rows = df_ppr.apply(lambda row: any('SMIP per SITE' in str(cell) and 'OUTSIDE' not in str(cell) 
-                                         for cell in row), axis=1)
-    outside_smip_rows = df_ppr.apply(lambda row: any('OUTSIDE SMIP per SITE' in str(cell) 
-                                                for cell in row), axis=1)
-    
-    if any(smip_rows) and any(outside_smip_rows):
-        smip_indices = df_ppr[smip_rows].index
-        outside_smip_indices = df_ppr[outside_smip_rows].index
-        
-        if active_sheet == "SMIP Database":
-            start_idx = min(smip_indices)
-            end_idx = min(outside_smip_indices)
-            df_ppr = df_ppr.iloc[start_idx:end_idx].reset_index(drop=True)
-        elif active_sheet == "Outside-SMIP Database":
-            start_idx = min(outside_smip_indices)
-            next_smip_indices = [idx for idx in smip_indices if idx > start_idx]
-            end_idx = min(next_smip_indices) if next_smip_indices else len(df_ppr)
-            df_ppr = df_ppr.iloc[start_idx:end_idx].reset_index(drop=True)
-
-    if "Site Name" in df_ppr.columns:
-        df_ppr = df_ppr[df_ppr["Site Name"].isin(df["Site Name"].unique())]
-
-    ppr_columns = [col for col in df_ppr.columns if '-' in str(col)]
-    if ppr_columns:
-        df_ppr[ppr_columns] = df_ppr[ppr_columns].apply(pd.to_numeric, errors='coerce')
-        df_ppr["PPR"] = df_ppr[ppr_columns].mean(axis=1) * 100
-        this_year_ppr_df = df_ppr.groupby("Site Name", as_index=False)["PPR"].mean()
-    else:
-        st.warning("No valid 'PPR' columns found in the filtered data.")
-
-    this_year_ppr_df["PPR"] = this_year_ppr_df["PPR"].round(2)
-
-    this_year_df = pd.merge(this_year_kwh_df, this_year_sp_df, on="Site Name", how="outer")
-    this_year_df = pd.merge(this_year_df, this_year_ppr_df, on="Site Name", how="outer")
-    this_year_df = this_year_df.sort_values(by="PPR", ascending=False)
-
-    return this_year_df
 
 def filter_by_cluster(df):
         clusters = df["Cluster"].dropna().unique().tolist()
@@ -1220,7 +1078,6 @@ def kWh(show_subheader=True):
         grouped_df = combined_df.groupby(["Date", "Site Name"], as_index=False)["kWh"].sum()
         grouped_df.sort_values(["Date", "Site Name"], inplace=True)
         grouped_df["Cumulative kWh"] = grouped_df.groupby("Site Name")["kWh"].cumsum().round(2)
-        # Add formatted date label
         grouped_df["Date_Label"] = grouped_df["Date"].dt.strftime('%b %d')
         if show_subheader:
             st.subheader("📈Cumulative kWh Trend from Start to Present")
@@ -1374,6 +1231,10 @@ if uploaded_file:
     if "active_sheet" not in st.session_state:
         st.session_state["active_sheet"] = "SMIP Database"
 
+    if 'results_df' not in st.session_state:
+        st.session_state.results_df = pd.DataFrame() 
+    if 'last_7_days_df' not in st.session_state:
+        st.session_state.last_7_days_df = pd.DataFrame()
     st.sidebar.image("GEMI_logo.png")
     
     selected_page = option_menu(
@@ -1431,12 +1292,11 @@ if uploaded_file:
 
     df = pd.read_excel(xls, sheet_name=sheet_name, header=8)
     df.columns = df.columns.str.strip()
-
+    
     if selected_page == "Analysis":
-        if 'tables_loaded' not in st.session_state:
-            st.session_state.tables_loaded = False
-            
-        if not st.session_state.tables_loaded:
+
+
+        if st.session_state.results_df.empty or st.session_state.last_7_days_df.empty:
             yesterday_kwh_df = get_yesterday_kwh(xls, st.session_state["active_sheet"], df)
             yesterday_sp_df = get_yesterday_sp(xls, st.session_state["active_sheet"], df)
             yesterday_af_df = get_yesterday_ppr(xls, st.session_state["active_sheet"], df)
@@ -1467,8 +1327,6 @@ if uploaded_file:
             
             st.session_state.results_df = results_df
             st.session_state.last_7_days_df = last_7_days_df
-            
-            st.session_state.tables_loaded = True
         
         col1, col2 = st.columns(2)
 
@@ -1483,7 +1341,6 @@ if uploaded_file:
 
         with col2:
             st.subheader("Last 7 Days' Ranking per Site")
-            
             styled_df = st.session_state.last_7_days_df.style.format({
                 "kWh": "{:.2f}",
                 "Specific Production": "{:.1f}",
@@ -1502,7 +1359,9 @@ if uploaded_file:
             
             st.write(styled_df)
         if st.button("Refresh Tables"):
-            st.session_state.tables_loaded = False
+            # Clear the dataframes to force reload
+            st.session_state.results_df = pd.DataFrame()
+            st.session_state.last_7_days_df = pd.DataFrame()
             st.rerun()
         st.markdown("#")
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -1517,11 +1376,6 @@ if uploaded_file:
         
         with col3:
             time_filter = st.selectbox("Select Timeframe", ["Daily", "Monthly", "Yearly", "Cumulative"])
-
-        # if time_filter == "Cumulative":
-        #    show_prediction = st.sidebar.checkbox("Show Prediction", value=False)
-        #else:
-        #    show_prediction = False
 
         kwh_sheets = [str(sheet) for sheet in xls.sheet_names if 'kWh' in str(sheet) and 'Target' not in str(sheet)]
         sp_sheets = [str(sheet) for sheet in xls.sheet_names if 'SP' in str(sheet) and 'Target' not in str(sheet)]
@@ -1607,6 +1461,7 @@ if uploaded_file:
 
             except Exception as e:
                 st.error(f"Failed to load {sheet}: {str(e)}")
+                combined_ppr_df = pd.DataFrame() 
 
         for sheet in sp_sheets:
             try:
@@ -1993,7 +1848,84 @@ if uploaded_file:
             st.plotly_chart(fig_bar)
 
     if selected_page == "Dashboard":
+        if 'tables_loaded' not in st.session_state:
+            st.session_state.tables_loaded = False
+            
+        if not st.session_state.tables_loaded:
+            yesterday_kwh_df = get_yesterday_kwh(xls, st.session_state["active_sheet"], df)
+            yesterday_sp_df = get_yesterday_sp(xls, st.session_state["active_sheet"], df)
+            yesterday_ppr_df = get_yesterday_ppr(xls, st.session_state["active_sheet"], df)
 
+            results_df = pd.merge(yesterday_kwh_df, yesterday_sp_df, on="Site Name", how="outer")
+            results_df = pd.merge(results_df, yesterday_ppr_df, on="Site Name", how="outer")
+            results_df = results_df.sort_values(by=["PPR", "Specific Production", "kWh"], ascending=False)
+            results_df.reset_index(drop=True, inplace=True)
+
+            if len(results_df) < 15:
+                results_df = pd.concat([results_df, pd.DataFrame(columns=results_df.columns)], ignore_index=True)
+                results_df = results_df.iloc[:15]
+
+            least_performers = results_df.nsmallest(5, "PPR")
+            
+            if len(results_df) > 5:
+                results_df = pd.concat([results_df.iloc[:-5], least_performers], ignore_index=True)
+            else:
+                results_df = least_performers  
+
+            if "Availability Factor" in results_df.columns:
+                results_df["Availability Factor"] = (results_df["Availability Factor"]).round(2)
+
+            results_df.index = range(1, len(results_df) + 1)
+            
+            cluster_results_df = get_yesterday_ranking_per_cluster(df, yesterday_kwh_df, yesterday_sp_df, yesterday_ppr_df)
+            cluster_results_df.index = range(1, len(cluster_results_df) + 1)
+            
+            last_7_days_df = get_last_7_days_table(xls, st.session_state["active_sheet"], df)
+            last_7_days_cluster_df = get_last_7_days_ranking_per_cluster(df, last_7_days_df)
+            last_7_days_cluster_df.index = range(1, len(last_7_days_cluster_df) + 1)
+            
+            st.session_state.cluster_results_df = cluster_results_df
+            st.session_state.last_7_days_cluster_df = last_7_days_cluster_df
+            
+            st.session_state.tables_loaded = True
+        else:
+            if 'cluster_results_df' not in st.session_state or 'last_7_days_cluster_df' not in st.session_state:
+                yesterday_kwh_df = get_yesterday_kwh(xls, st.session_state["active_sheet"], df)
+                yesterday_sp_df = get_yesterday_sp(xls, st.session_state["active_sheet"], df)
+                yesterday_ppr_df = get_yesterday_ppr(xls, st.session_state["active_sheet"], df)
+                
+                cluster_results_df = get_yesterday_ranking_per_cluster(df, yesterday_kwh_df, yesterday_sp_df, yesterday_ppr_df)
+                cluster_results_df.index = range(1, len(cluster_results_df) + 1)
+                
+                last_7_days_df = get_last_7_days_table(xls, st.session_state["active_sheet"], df)
+                last_7_days_cluster_df = get_last_7_days_ranking_per_cluster(df, last_7_days_df)
+                last_7_days_cluster_df.index = range(1, len(last_7_days_cluster_df) + 1)
+                
+                st.session_state.cluster_results_df = cluster_results_df
+                st.session_state.last_7_days_cluster_df = last_7_days_cluster_df
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Yesterday's Ranking per Cluster")
+            st.write(st.session_state.cluster_results_df.style.format({
+                "kWh": "{:.2f}",
+                "Specific Production": "{:.1f}",
+                "PPR": "{:.2f}%" 
+            }).set_properties(**{'border-color': 'black', 'border-width': '1px'})
+            .set_table_styles([dict(selector='th', props=[('font-size', '12pt'), ('text-align', 'center'), ('position', 'sticky'), ('top', '0')])]))
+        
+        with col2:
+            st.subheader("Last 7 Days' Ranking per Cluster")
+            st.write(st.session_state.last_7_days_cluster_df.style.format({
+                "kWh": "{:.2f}",
+                "Specific Production": "{:.1f}",
+                "PPR": "{:.2f}%" 
+            }).set_properties(**{'border-color': 'black', 'border-width': '1px'})
+            .set_table_styles([dict(selector='th', props=[('font-size', '12pt'), ('text-align', 'center'), ('position', 'sticky'), ('top', '0')])]))
+                
+        if st.button("Refresh Tables"):
+            st.session_state.tables_loaded = False
+            st.rerun()
         st.markdown("#")
 
         st.subheader("kWh/Target kWh Chart")
@@ -2010,7 +1942,7 @@ if uploaded_file:
                 start_date = st.date_input("Select Start Date", value=datetime.today() - timedelta(days=7), key="graph_start_date")
 
             with col3:
-                end_date = st.date_input("Select End Date", value=datetime.today(), key="graph_end_date")
+                end_date = st.date_input("Select End Date", value=yesterday, key="graph_end_date")
 
         start_date = pd.to_datetime(start_date)
         end_date = pd.to_datetime(end_date)
@@ -2074,3 +2006,29 @@ if uploaded_file:
             ]))
         else:
             st.warning("No data available for the selected filters.")
+
+        ppr_df = get_ppr_data(xls, st.session_state["active_sheet"], df, start_date, end_date)
+        if ppr_df is not None and not ppr_df.empty:
+            ppr_df = ppr_df.groupby("Site Name", as_index=False)["PPR"].mean()
+            ppr_df = ppr_df.sort_values(by="PPR", ascending=False).reset_index(drop=True)
+            ppr_df["PPR"] = ppr_df["PPR"].round(2)
+
+            fig_ppr = px.bar(
+                ppr_df,
+                x="PPR",
+                y="Site Name",
+                orientation="h",
+                labels={"PPR": "PPR (%)", "Site Name": "Site"},
+                color="PPR",
+                color_continuous_scale="viridis",
+                height=650
+            )
+            fig_ppr.update_layout(
+                title_text="Highest to Lowest PPR Production",
+                xaxis_title="PPR (%)",
+                yaxis_title="Site Name",
+                yaxis=dict(categoryorder="total ascending")
+            )
+            st.plotly_chart(fig_ppr)
+        else:
+            st.warning("No PPR data available for the selected date range.")
